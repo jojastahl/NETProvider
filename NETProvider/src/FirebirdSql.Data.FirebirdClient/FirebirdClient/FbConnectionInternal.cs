@@ -19,6 +19,8 @@
  *      Jiri Cincura (jiri@cincura.net)
  */
 
+#define VARIANTE_3
+
 using System;
 using System.Collections.Generic;
 using System.Data;
@@ -39,8 +41,19 @@ namespace FirebirdSql.Data.FirebirdClient
 		private IDatabase _db;
 		private FbTransaction _activeTransaction;
 		private List<WeakReference> _preparedCommands;
+#if VARIANTE_3
 		private int _preparedCommandsUsed;
 		private int _preparedCommandsAddCalled;
+#endif
+#if VARIANTE_2
+		private int _preparedCommandsReused;
+		private int _preparedCommandsAdded;
+		private int _preparedCommandsRemoved;
+		private int _preparedCommandsOptimal;
+#endif
+#if VARIANTE_1
+		private WeakReference<Queue<WeakReference>> _wrefStock;
+#endif
 		private FbConnectionString _options;
 		private FbConnection _owningConnection;
 		private bool _disposed;
@@ -94,6 +107,9 @@ namespace FirebirdSql.Data.FirebirdClient
 		{
 			_preparedCommands = new List<WeakReference>();
 			_preparedCommandsCleanupSyncRoot = new object();
+#if VARIANTE_2
+			new PreparedCommnandOptimisationHelper(this);
+#endif
 
 			_options = options;
 
@@ -139,7 +155,9 @@ namespace FirebirdSql.Data.FirebirdClient
 
 					if (disposing)
 					{
-						// release managed resources here
+#if VARIANTE_1
+						_wrefStock = null;
+#endif
 					}
 
 					_disposed = true;
@@ -377,6 +395,7 @@ namespace FirebirdSql.Data.FirebirdClient
 
 		#region Prepared Commands Methods
 
+#if VARIANTE_3
 		public void AddPreparedCommand(FbCommand command)
 		{
 			lock (_preparedCommandsCleanupSyncRoot)
@@ -499,6 +518,292 @@ namespace FirebirdSql.Data.FirebirdClient
 				_preparedCommandsAddCalled = 0;
 			}
 		}
+
+#endif
+
+#if VARIANTE_2
+		public void AddPreparedCommand(FbCommand command)
+		{
+			lock (_preparedCommandsCleanupSyncRoot)
+			{
+				int position = -1;
+				for (int i = 0; i < _preparedCommands.Count; i++)
+				{
+					FbCommand current;
+					if (!_preparedCommands[i].TryGetTarget<FbCommand>(out current))
+					{
+						if (position == -1)
+							position = i;
+					}
+					else
+					{
+						if (current == command)
+						{
+							return;
+						}
+					}
+				}
+				if (position >= 0)
+				{
+					_preparedCommands[position].Target = command;
+					_preparedCommandsReused++;
+				}
+				else
+				{
+					_preparedCommands.Add(new WeakReference(command));
+					_preparedCommandsAdded++;
+				}
+			}
+		}
+
+		private class PreparedCommnandOptimisationHelper
+		{
+			private FbConnectionInternal _connection;
+			private int _lastGuess;
+			public PreparedCommnandOptimisationHelper(FbConnectionInternal connection, int lastGuess = 0)
+			{
+				_connection = connection;
+				_lastGuess = lastGuess;
+			}
+			~PreparedCommnandOptimisationHelper()
+			{
+				lock (_connection._preparedCommandsCleanupSyncRoot)
+				{
+					int guess = _connection._preparedCommandsAdded + Math.Max(0, _connection._preparedCommandsReused - _connection._preparedCommandsRemoved);
+					if (_connection._preparedCommandsAdded != 0 && guess - _lastGuess < _connection._preparedCommandsAdded)
+						guess = _lastGuess + _connection._preparedCommandsAdded;
+					_connection._preparedCommandsOptimal = Math.Max(0, _connection._preparedCommandsOptimal + guess - _lastGuess);
+					Debug.Print("CurrentCount = {0}, Optimal = {1}, Added = {2}, Reused = {3}, Removed = {4}, Guess = {5}, LastGuess = {6}", _connection._preparedCommands.Count, _connection._preparedCommandsOptimal, _connection._preparedCommandsAdded, _connection._preparedCommandsReused, _connection._preparedCommandsRemoved, guess, _lastGuess);
+					_connection._preparedCommandsAdded = 0;
+					_connection._preparedCommandsReused = 0;
+					_connection._preparedCommandsRemoved = 0;
+					new PreparedCommnandOptimisationHelper(_connection, guess);
+				}
+			}
+		}
+
+		public void RemovePreparedCommand(FbCommand command)
+		{
+			lock (_preparedCommandsCleanupSyncRoot)
+			{
+				if (_preparedCommandsReused == 0 && _preparedCommandsAdded == 0)
+				{
+					// Calling RemovePreparedCommand multiple times without AddPreparedCommand,
+					// Keep all WeakReferences and scan just for the command to remove
+					for (int i = 0; i < _preparedCommands.Count; ++i)
+					{
+						var item = _preparedCommands[i];
+						FbCommand current;
+						if (item.TryGetTarget(out current))
+						{
+							if (current == command)
+							{
+								item.Target = null;
+								_preparedCommandsRemoved++;
+								return;
+							}
+						}
+					}
+				}
+				else
+				{
+					// Some commands added since last call to RemovePreparedCommand,
+					// We take the number of adds as an indicator how many WeakReferences
+					// we should keep around for future adds
+					// While scanning for command to remove, concentrate all used
+					// WeakReferences at the beginning of the list
+					int k = 0;
+					for (int i = 0; i < _preparedCommands.Count; ++i)
+					{
+						var item = _preparedCommands[i];
+						FbCommand current;
+						if (item.TryGetTarget(out current))
+						{
+							if (current == command)
+							{
+								item.Target = null;
+								_preparedCommandsRemoved++;
+							}
+							else
+							{
+								_preparedCommands[i] = _preparedCommands[k];
+								_preparedCommands[k++] = item;
+							}
+						}
+					}
+					if (k <= _preparedCommandsOptimal && _preparedCommandsOptimal + Math.Max(1, _preparedCommandsOptimal / 8) < _preparedCommands.Count)
+						_preparedCommands.RemoveRange(_preparedCommandsOptimal, _preparedCommands.Count - _preparedCommandsOptimal);
+				}
+			}
+		}
+
+		public void ReleasePreparedCommands()
+		{
+
+			lock (_preparedCommandsCleanupSyncRoot)
+			{
+				WeakReference[] toProcess = new WeakReference[_preparedCommands.Count];
+				_preparedCommands.CopyTo(toProcess);
+				for (int i = 0; i < toProcess.Length; i++)
+				{
+					FbCommand current;
+					if (!toProcess[i].TryGetTarget(out current))
+						continue;
+
+					try
+					{
+						// Release statement handle
+						current.Release();
+					}
+					catch (System.IO.IOException)
+					{
+						// If an IO error occurs weh trying to release the command
+						// avoid it. ( It maybe the connection to the server was down
+						// for unknown reasons. )
+					}
+					catch (IscException ex)
+					{
+						if (ex.ErrorCode != IscCodes.isc_net_read_err &&
+							ex.ErrorCode != IscCodes.isc_net_write_err &&
+							ex.ErrorCode != IscCodes.isc_network_error)
+						{
+							throw;
+						}
+					}
+				}
+				_preparedCommands.Clear();
+				_preparedCommandsAdded = 0;
+			}
+		}
+#endif
+
+#if VARIANTE_1
+		public void AddPreparedCommand(FbCommand command)
+		{
+			lock (_preparedCommandsCleanupSyncRoot)
+			{
+				int position = -1;
+				for (int i = 0; i < _preparedCommands.Count; i++)
+				{
+					FbCommand current;
+					if (!_preparedCommands[i].TryGetTarget<FbCommand>(out current))
+					{
+						position = i;
+					}
+					else
+					{
+						if (current == command)
+						{
+							return;
+						}
+					}
+				}
+				if (position >= 0)
+				{
+					_preparedCommands[position].Target = command;
+				}
+				else
+				{
+					Queue<WeakReference> wrefQueue;
+					var tmpStock = _wrefStock;
+					if (tmpStock != null && tmpStock.TryGetTarget(out wrefQueue) && wrefQueue.Count != 0)
+					{
+						var wref = wrefQueue.Dequeue();
+						wref.Target = command;
+						_preparedCommands.Add(wref);
+					}
+					else
+					{
+						_preparedCommands.Add(new WeakReference(command));
+					}
+				}
+			}
+		}
+
+		public void RemovePreparedCommand(FbCommand command)
+		{
+			lock (_preparedCommandsCleanupSyncRoot)
+			{
+				Queue<WeakReference> wrefQueue;
+				var tmpStock = _wrefStock;
+				if (tmpStock == null)
+				{
+					wrefQueue = new Queue<WeakReference>();
+					_wrefStock = new WeakReference<Queue<WeakReference>>(wrefQueue);
+				}
+				else
+				{
+					if (!tmpStock.TryGetTarget(out wrefQueue))
+					{
+						wrefQueue = new Queue<WeakReference>();
+						tmpStock.SetTarget(wrefQueue);
+					}
+				}
+				int i = 0;
+				for (int j = i; j < _preparedCommands.Count; ++j)
+				{
+					var item = _preparedCommands[j];
+					FbCommand current;
+					if (item.TryGetTarget(out current))
+					{
+						if (current == command)
+						{
+							item.Target = null;
+							wrefQueue.Enqueue(item);
+						}
+						else
+						{
+							_preparedCommands[i++] = item;
+						}
+					}
+					else
+					{
+						wrefQueue.Enqueue(item);
+					}
+				}
+				_preparedCommands.RemoveRange(i, _preparedCommands.Count - i);
+			}
+		}
+
+		public void ReleasePreparedCommands()
+		{
+
+			lock (_preparedCommandsCleanupSyncRoot)
+			{
+				WeakReference[] toProcess = new WeakReference[_preparedCommands.Count];
+				_preparedCommands.CopyTo(toProcess);
+				for (int i = 0; i < toProcess.Length; i++)
+				{
+					FbCommand current;
+					if (!toProcess[i].TryGetTarget(out current))
+						continue;
+
+					try
+					{
+						// Release statement handle
+						current.Release();
+					}
+					catch (System.IO.IOException)
+					{
+						// If an IO error occurs weh trying to release the command
+						// avoid it. ( It maybe the connection to the server was down
+						// for unknown reasons. )
+					}
+					catch (IscException ex)
+					{
+						if (ex.ErrorCode != IscCodes.isc_net_read_err &&
+							ex.ErrorCode != IscCodes.isc_net_write_err &&
+							ex.ErrorCode != IscCodes.isc_network_error)
+						{
+							throw;
+						}
+					}
+				}
+				_preparedCommands.Clear();
+				_wrefStock = null;
+			}
+		}
+#endif
 
 		#endregion
 
