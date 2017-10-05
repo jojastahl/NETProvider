@@ -39,6 +39,8 @@ namespace FirebirdSql.Data.FirebirdClient
 		private IDatabase _db;
 		private FbTransaction _activeTransaction;
 		private List<WeakReference> _preparedCommands;
+		private int _preparedCommandsUsed;
+		private int _preparedCommandsAddCalled;
 		private FbConnectionString _options;
 		private FbConnection _owningConnection;
 		private bool _disposed;
@@ -380,6 +382,8 @@ namespace FirebirdSql.Data.FirebirdClient
 			lock (_preparedCommandsCleanupSyncRoot)
 			{
 				int position = -1;
+				bool found = false;
+				int used = 0;
 				for (int i = 0; i < _preparedCommands.Count; i++)
 				{
 					FbCommand current;
@@ -389,16 +393,54 @@ namespace FirebirdSql.Data.FirebirdClient
 					}
 					else
 					{
+						used++;
 						if (current == command)
-						{
-							return;
-						}
+							found = true;
 					}
 				}
-				if (position >= 0)
-					_preparedCommands[position].Target = command;
-				else
-					_preparedCommands.Add(new WeakReference(command));
+				if (!found)
+					used++;
+				if (used > _preparedCommandsUsed)
+					_preparedCommandsUsed = used;
+				if (!found)
+				{
+					_preparedCommandsAddCalled++;
+					if (position >= 0)
+						_preparedCommands[position].Target = command;
+					else
+						_preparedCommands.Add(new WeakReference(command));
+#if DEBUG
+					Debug.WriteLine("Count = {0}, _preparedCommandsUsed = {1}, used = {2}, adds = {3}", _preparedCommands.Count, _preparedCommandsUsed, used, _preparedCommandsAddCalled);
+#endif
+					if (_preparedCommandsAddCalled >= Math.Max(8, Math.Min(128, _preparedCommands.Count)))
+					{
+						if (_preparedCommandsUsed + Math.Max(1, _preparedCommandsUsed / 8) < _preparedCommands.Count)
+						{
+							int j = 0;
+							for (int i = _preparedCommands.Count - 1; i >= _preparedCommandsUsed; --i)
+							{
+								var tmp = _preparedCommands[i].Target;
+								if (tmp != null)
+								{
+									while (j < i && _preparedCommands[j].Target != null)
+										j++;
+									Debug.Assert(j < i);
+									if (j < i)
+									{
+										_preparedCommands[j].Target = tmp;
+										j++;
+									}
+								}
+							}
+#if DEBUG
+							Debug.WriteLine("Count = {0}, NewCount = {1}", _preparedCommands.Count, _preparedCommandsUsed);
+#endif
+							_preparedCommands.RemoveRange(_preparedCommandsUsed, _preparedCommands.Count - _preparedCommandsUsed);
+						}
+						_preparedCommandsAddCalled = 0;
+						_preparedCommandsUsed = 0;
+					}
+				}
 			}
 		}
 
@@ -412,7 +454,7 @@ namespace FirebirdSql.Data.FirebirdClient
 					FbCommand current;
 					if (item.TryGetTarget(out current) && current == command)
 					{
-						_preparedCommands.RemoveAt(i);
+						item.Target = null;
 						return;
 					}
 				}
@@ -453,6 +495,8 @@ namespace FirebirdSql.Data.FirebirdClient
 					}
 				}
 				_preparedCommands.Clear();
+				_preparedCommandsUsed = 0;
+				_preparedCommandsAddCalled = 0;
 			}
 		}
 
