@@ -421,38 +421,37 @@ namespace FirebirdSql.Data.FirebirdClient
 
 		public void ReleasePreparedCommands()
 		{
-			WeakReference[] toProcess = new WeakReference[_preparedCommands.Count];
-			_preparedCommands.CopyTo(toProcess);
-			for (int i = 0; i < toProcess.Length; i++)
-			{
-				FbCommand current;
-				if (!toProcess[i].TryGetTarget(out current))
-					continue;
-
-				try
-				{
-					// Release statement handle
-					current.Release();
-				}
-				catch (System.IO.IOException)
-				{
-					// If an IO error occurs weh trying to release the command
-					// avoid it. ( It maybe the connection to the server was down
-					// for unknown reasons. )
-				}
-				catch (IscException ex)
-				{
-					if (ex.ErrorCode != IscCodes.isc_net_read_err &&
-						ex.ErrorCode != IscCodes.isc_net_write_err &&
-						ex.ErrorCode != IscCodes.isc_network_error)
-					{
-						throw;
-					}
-				}
-			}
-
 			lock (_preparedCommandsCleanupSyncRoot)
 			{
+				WeakReference[] toProcess = new WeakReference[_preparedCommands.Count];
+				_preparedCommands.CopyTo(toProcess);
+				for (int i = 0; i < toProcess.Length; i++)
+				{
+					FbCommand current;
+					if (!toProcess[i].TryGetTarget(out current))
+						continue;
+
+					try
+					{
+						// Release statement handle
+						current.Release();
+					}
+					catch (System.IO.IOException)
+					{
+						// If an IO error occurs weh trying to release the command
+						// avoid it. ( It maybe the connection to the server was down
+						// for unknown reasons. )
+					}
+					catch (IscException ex)
+					{
+						if (ex.ErrorCode != IscCodes.isc_net_read_err &&
+							ex.ErrorCode != IscCodes.isc_net_write_err &&
+							ex.ErrorCode != IscCodes.isc_network_error)
+						{
+							throw;
+						}
+					}
+				}
 				_preparedCommands.Clear();
 			}
 		}
