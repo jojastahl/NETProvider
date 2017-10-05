@@ -377,26 +377,29 @@ namespace FirebirdSql.Data.FirebirdClient
 
 		public void AddPreparedCommand(FbCommand command)
 		{
-			int position = -1;
-			for (int i = 0; i < _preparedCommands.Count; i++)
+			lock (_preparedCommandsCleanupSyncRoot)
 			{
-				FbCommand current;
-				if (!_preparedCommands[i].TryGetTarget<FbCommand>(out current))
+				int position = -1;
+				for (int i = 0; i < _preparedCommands.Count; i++)
 				{
-					position = i;
-				}
-				else
-				{
-					if (current == command)
+					FbCommand current;
+					if (!_preparedCommands[i].TryGetTarget<FbCommand>(out current))
 					{
-						return;
+						position = i;
+					}
+					else
+					{
+						if (current == command)
+						{
+							return;
+						}
 					}
 				}
+				if (position >= 0)
+					_preparedCommands[position].Target = command;
+				else
+					_preparedCommands.Add(new WeakReference(command));
 			}
-			if (position >= 0)
-				_preparedCommands[position].Target = command;
-			else
-				_preparedCommands.Add(new WeakReference(command));
 		}
 
 		public void RemovePreparedCommand(FbCommand command)
